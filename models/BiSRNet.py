@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 import torch.nn as nn
@@ -32,6 +33,9 @@ class FCN(nn.Module):
         for n, m in self.layer4.named_modules():
             if 'conv1' in n or 'downsample.0' in n:
                 m.stride = (1, 1)
+        self.head = nn.Sequential(nn.Conv2d(512, 128, kernel_size=1, stride=1, padding=0, bias=False),
+                                  nn.BatchNorm2d(128), nn.ReLU())
+        initialize_weights(self.head)
                                   
     def _make_layer(self, block, inplanes, planes, blocks, stride=1):
         downsample = None
@@ -100,7 +104,8 @@ class SR(nn.Module):
         m_batchsize, C, height, width = x.size()
         proj_query = self.query_conv(x).view(m_batchsize, -1, width*height).permute(0, 2, 1)
         proj_key = self.key_conv(x).view(m_batchsize, -1, width*height)
-        energy = torch.bmm(proj_query, proj_key)
+        scale = math.sqrt(self.query_conv.out_channels)
+        energy = torch.bmm(proj_query, proj_key) / scale
         attention = self.softmax(energy)
         proj_value = self.value_conv(x).view(m_batchsize, -1, width*height)
 
@@ -146,12 +151,13 @@ class CotSR(nn.Module):
         k2 = self.key_conv2(x2).view(m_batchsize, -1, width*height)
         v2 = self.value_conv2(x2).view(m_batchsize, -1, width*height)
         
-        energy1 = torch.bmm(q1, k2)
+        scale = math.sqrt(self.query_conv1.out_channels)
+        energy1 = torch.bmm(q1, k2) / scale
         attention1 = self.softmax(energy1)
         out1 = torch.bmm(v2, attention1.permute(0, 2, 1))
         out1 = out1.view(m_batchsize, C, height, width)
                 
-        energy2 = torch.bmm(q2, k1)
+        energy2 = torch.bmm(q2, k1) / scale
         attention2 = self.softmax(energy2)
         out2 = torch.bmm(v1, attention2.permute(0, 2, 1))
         out2 = out2.view(m_batchsize, C, height, width)
@@ -165,7 +171,7 @@ class BiSRNet(nn.Module):
     def __init__(self, in_channels=3, num_classes=7):
         super(BiSRNet, self).__init__()        
         self.FCN = FCN(in_channels, pretrained=True)
-        self.SiamSR = SR(128)
+        self.SR = SR(128)
         self.CotSR = CotSR(128)
         
         self.resCD = self._make_layer(ResBlock, 256, 128, 6, stride=1)
@@ -173,7 +179,7 @@ class BiSRNet(nn.Module):
         self.classifier2 = nn.Conv2d(128, num_classes, kernel_size=1)
         
         self.classifierCD = nn.Sequential(nn.Conv2d(128, 64, kernel_size=1), nn.BatchNorm2d(64), nn.ReLU(), nn.Conv2d(64, 1, kernel_size=1))
-        initialize_weights(self.head, self.SiamSR, self.resCD, self.CotSR, self.classifierCD, self.classifier1, self.classifier2)
+        initialize_weights(self.resCD, self.classifierCD, self.classifier1, self.classifier2)
     
     def _make_layer(self, block, inplanes, planes, blocks, stride=1):
         downsample = None
@@ -199,7 +205,6 @@ class BiSRNet(nn.Module):
         x = self.FCN.layer3(x) #size:1/16
         x = self.FCN.layer4(x)
         x = self.FCN.head(x)
-        x = self.SiamSR(x)
         
         return x
     
@@ -211,13 +216,15 @@ class BiSRNet(nn.Module):
         return change
     
     def forward(self, x1, x2):
-        x_size = x1.size()        
+        x_size = x1.size()
         x1 = self.base_forward(x1)
         x2 = self.base_forward(x2)
+        x1 = self.SR(x1)
+        x2 = self.SR(x2)
         change = self.CD_forward(x1, x2)
         
         x1, x2 = self.CotSR(x1, x2)
         out1 = self.classifier1(x1)
         out2 = self.classifier2(x2)        
         
-        return F.upsample(change, x_size[2:], mode='bilinear'), F.upsample(out1, x_size[2:], mode='bilinear'), F.upsample(out2, x_size[2:], mode='bilinear')
+        return F.interpolate(change, x_size[2:], mode='bilinear'), F.interpolate(out1, x_size[2:], mode='bilinear'), F.interpolate(out2, x_size[2:], mode='bilinear')
